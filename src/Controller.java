@@ -104,15 +104,17 @@ public class Controller {
                 return;
             }
 
-            // Create new FileInfo object
             fileInfo = new FileInfo(filename, fileSize);
             index.put(filename, fileInfo);
 
-            // Assign least-loaded Dstores to store the file
             List<Integer> selectedPorts = getLeastLoadedDstores(rep);
-            fileInfo.setDstores(selectedPorts);
 
-            // Start storing process by notifying Dstores
+            // Reserve the Dstores immediately so their fileCount reflects pending storage
+            for (int port : selectedPorts) {
+                dStores.get(port).incrementFileCount();
+            }
+
+            fileInfo.setDstores(selectedPorts);
             ackCounter.put(filename, 0);
             clientStoreSockets.put(filename, socket);
 
@@ -123,6 +125,7 @@ public class Controller {
             out.println(response);
         }
     }
+
 
     private static void handleStoreAck(String line, int rep) {
         String[] parts = line.split(" ");
@@ -139,9 +142,7 @@ public class Controller {
                     PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
                     FileInfo fileInfo = index.get(filename);
                     List<Integer> dStoresWithFile = fileInfo.getDstores();
-                    for (int currentPort : dStoresWithFile) {
-                        dStores.get(currentPort).incrementFileCount();
-                    }
+                    System.out.println(dStoresWithFile);
                     clientOut.println("STORE_COMPLETE");
                 } catch (IOException e) {
                     System.out.println("Error responding to client for " + filename);
@@ -263,7 +264,7 @@ public class Controller {
         }
     }
 
-    private static List<Integer> getLeastLoadedDstores(int rep) {
+    private static synchronized List<Integer> getLeastLoadedDstores(int rep) {
         // Create list of (port, fileCount) pairs
         List<Map.Entry<Integer, Integer>> entries = new ArrayList<>();
         for (Map.Entry<Integer, DstoreInfo> entry : dStores.entrySet()) {
@@ -283,7 +284,7 @@ public class Controller {
                 i++;
             }
         }
-
+        System.out.println(result);
         // Trim to exactly `rep` if more than needed (e.g., from ties)
         return result.subList(0, rep);
     }

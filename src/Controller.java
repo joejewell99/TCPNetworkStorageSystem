@@ -10,31 +10,37 @@ public class Controller {
     private static final Map<String, Integer> ackCounter = new ConcurrentHashMap<>();
     private static final Map<String, Socket> clientStoreSockets = new ConcurrentHashMap<>();
     private static final Map<String, Integer> fileToFileSize = new ConcurrentHashMap<>();
-    public static Set<String> allFilesList = new HashSet<>();
+    private static final Map<String, FileState> fileStates = new ConcurrentHashMap<>();
     private static final Map<String, Integer> removeAckCounter = new ConcurrentHashMap<>();
     private static final Map<String, Socket> clientRemoveSockets = new ConcurrentHashMap<>();
-    private static final Set<String> removingFiles = ConcurrentHashMap.newKeySet();
 
-
+    enum FileState {
+        STORE_IN_PROGRESS,
+        STORE_COMPLETE,
+        REMOVE_IN_PROGRESS,
+        REMOVE_COMPLETE
+    }
 
     public static void main(String[] args) throws Exception {
         int port = Integer.parseInt(args[0]);
         int rep = Integer.parseInt(args[1]);
         int timeOut = Integer.parseInt(args[2]);
         int reFactor = Integer.parseInt(args[3]);
+
         ServerSocket serverSocket = new ServerSocket(port);
         System.out.println("Controller running on port " + port);
 
         while (true) {
             Socket socket = serverSocket.accept();
-            new Thread(() -> handleConnection(socket, rep)).start();
+            new Thread(() -> handleConnection(socket, rep, timeOut)).start();
         }
     }
 
-    private static void handleConnection(Socket socket, int rep) {
-        try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+    private static void handleConnection(Socket socket, int rep, int timeOut) {
+        try (
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                PrintWriter out = new PrintWriter(socket.getOutputStream(), true)
+        ) {
             String line;
 
             while ((line = in.readLine()) != null) {
@@ -42,166 +48,168 @@ public class Controller {
 
                 if (line.startsWith("JOIN")) {
                     int dstorePort = Integer.parseInt(line.split(" ")[1]);
-                    if (!dstorePorts.contains(dstorePort)) {
-                        dstorePorts.add(dstorePort);
-                        System.out.println("Dstore joined on port: " + dstorePort);
+                    synchronized (dstorePorts) {
+                        if (!dstorePorts.contains(dstorePort)) {
+                            dstorePorts.add(dstorePort);
+                            System.out.println("Dstore joined on port: " + dstorePort);
+                        }
                     }
 
                 } else if (line.startsWith("STORE ")) {
                     String[] parts = line.split(" ");
                     String filename = parts[1];
                     int fileSize = Integer.parseInt(parts[2]);
-                    allFilesList.add(filename);
 
-
-                    fileToFileSize.put(filename, fileSize);
-                    System.out.println("File entry updated: " + filename + " = " + fileSize);
-
-                    System.out.println("STORE request for file: " + filename + ", size: " + fileSize);
-
-                    // Select R Dstores
-                    if (dstorePorts.size() < rep) {
-                        out.println("ERROR_NOT_ENOUGH_DSTORES");
-                        return;
+                    synchronized (dstorePorts) {
+                        if (dstorePorts.size() < rep) {
+                            out.println("ERROR_NOT_ENOUGH_DSTORES");
+                            continue;
+                        }
                     }
 
-                    // making the controller to client response
-                    List<Integer> selectedPorts = dstorePorts.subList(0, rep);
+                    synchronized (fileStates) {
+                        FileState state = fileStates.get(filename);
+                        if (state == FileState.STORE_COMPLETE || state == FileState.STORE_IN_PROGRESS || state == FileState.REMOVE_IN_PROGRESS) {
+                            out.println("ERROR_FILE_ALREADY_EXISTS");
+                            continue;
+                        }
+                        fileStates.put(filename, FileState.STORE_IN_PROGRESS);
+                    }
+
+                    fileToFileSize.put(filename, fileSize);
+
+                    List<Integer> selectedPorts;
+                    synchronized (dstorePorts) {
+                        selectedPorts = new ArrayList<>(dstorePorts.subList(0, rep));
+                    }
+
+                    fileToDstores.put(filename, new HashSet<>(selectedPorts));
+                    ackCounter.put(filename, 0);
+                    clientStoreSockets.put(filename, socket);
+
                     StringBuilder response = new StringBuilder("STORE_TO");
                     for (int port : selectedPorts) {
                         response.append(" ").append(port);
                     }
-
-                    // Track store progress
-                    fileToDstores.put(filename, new HashSet<>(selectedPorts));
-                    ackCounter.put(filename, 0);
-                    clientStoreSockets.put(filename, socket); // Save socket for sending STORE_COMPLETE later
-
-                    out.println(response.toString());
+                    out.println(response);
 
                 } else if (line.startsWith("STORE_ACK")) {
                     String[] parts = line.split(" ");
                     String filename = parts[1];
 
-                    ackCounter.put(filename, ackCounter.getOrDefault(filename, 0) + 1);
-                    int currentAckCount = ackCounter.get(filename);
+                    int count = ackCounter.compute(filename, (k, v) -> (v == null) ? 1 : v + 1);
+                    System.out.println("ACK received for file: " + filename + " (" + count + "/" + rep + ")");
 
-                    System.out.println("ACK received for file: " + filename + " (" + currentAckCount + "/" + rep + ")");
-
-                    if (currentAckCount >= rep) {
-                        // Send STORE_COMPLETE to client
-                        Socket clientSocket = clientStoreSockets.get(filename);
+                    if (count >= rep) {
+                        Socket clientSocket = clientStoreSockets.remove(filename);
                         if (clientSocket != null && !clientSocket.isClosed()) {
-                            PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
-                            clientOut.println("STORE_COMPLETE");
-                            System.out.println("STORE_COMPLETE sent to client for file: " + filename);
+                            try {
+                                PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
+                                clientOut.println("STORE_COMPLETE");
+                            } catch (IOException e) {
+                                System.out.println("Error responding to client for " + filename);
+                            }
                         }
-                        // Clean up
                         ackCounter.remove(filename);
-                        clientStoreSockets.remove(filename);
+                        fileStates.put(filename, FileState.STORE_COMPLETE);
                     }
 
                 } else if (line.startsWith("LIST")) {
-                    String fileList = String.join(" ", allFilesList);
-                    out.println("LIST " + fileList);
+                    StringBuilder listResponse = new StringBuilder("LIST");
+                    synchronized (fileStates) {
+                        for (Map.Entry<String, FileState> entry : fileStates.entrySet()) {
+                            if (entry.getValue() == FileState.STORE_COMPLETE) {
+                                listResponse.append(" ").append(entry.getKey());
+                            }
+                        }
+                    }
+                    out.println(listResponse.toString());
 
                 } else if (line.startsWith("LOAD")) {
                     String[] parts = line.split(" ");
                     String filename = parts[1];
 
-                    System.out.println("Loading File Name: " + filename);
+                    FileState state = fileStates.get(filename);
+                    if (state != FileState.STORE_COMPLETE) {
+                        out.println("ERROR_FILE_DOES_NOT_EXIST");
+                        continue;
+                    }
 
                     Set<Integer> dStoresWithFile = fileToDstores.get(filename);
                     if (dStoresWithFile == null || dStoresWithFile.isEmpty()) {
                         out.println("ERROR_FILE_DOES_NOT_EXIST");
-                        return;
+                        continue;
                     }
 
-                    List<Integer> portNumsWhereFileIs = new ArrayList<>(dStoresWithFile);
-                    int randomChosenPort = portNumsWhereFileIs.get(new Random().nextInt(portNumsWhereFileIs.size()));
+                    List<Integer> ports = new ArrayList<>(dStoresWithFile);
+                    int chosenPort = ports.get(new Random().nextInt(ports.size()));
+                    int size = fileToFileSize.get(filename);
+                    out.println("LOAD_FROM " + chosenPort + " " + size);
 
-                    Integer fileSize = fileToFileSize.get(filename);
-                    if (fileSize == null) {
-                        out.println("ERROR_FILE_DOES_NOT_EXIST");
-                        return;
-                    }
-
-                    out.println("LOAD_FROM " + randomChosenPort + " " + fileSize);
                 } else if (line.startsWith("REMOVE ")) {
                     String[] parts = line.split(" ");
-                    if (parts.length < 2) {
-                        System.out.println("Malformed REMOVE: " + line);
-                        continue;
-                    }
                     String filename = parts[1];
 
-                    if (dstorePorts.size() < rep) {
-                        out.println("ERROR_NOT_ENOUGH_DSTORES");
-                        continue;
+                    synchronized (fileStates) {
+                        FileState state = fileStates.get(filename);
+                        if (state != FileState.STORE_COMPLETE) {
+                            out.println("ERROR_FILE_DOES_NOT_EXIST");
+                            continue;
+                        }
+                        fileStates.put(filename, FileState.REMOVE_IN_PROGRESS);
                     }
 
-                    if (!fileToDstores.containsKey(filename)) {
-                        out.println("REMOVE_COMPLETE");
-                        continue;
-                    }
-
-                    System.out.println("Initiating REMOVE for " + filename);
-
-                    removingFiles.add(filename);
                     removeAckCounter.put(filename, 0);
                     clientRemoveSockets.put(filename, socket);
 
                     Set<Integer> dstores = fileToDstores.get(filename);
-                    for (int dstorePort : dstores) {
-                        try {
-                            Socket dstoreSocket = new Socket("localhost", dstorePort);
-                            PrintWriter dstoreOut = new PrintWriter(dstoreSocket.getOutputStream(), true);
-                            dstoreOut.println("REMOVE " + filename);
-                        } catch (IOException e) {
-                            System.out.println("Failed to connect to Dstore on port: " + dstorePort);
-                            // Dstore failure; we do nothing (file stays in "removing" state)
-                        }
+                    for (int port : dstores) {
+                        new Thread(() -> {
+                            try (Socket dstoreSocket = new Socket("localhost", port);
+                                 PrintWriter dstoreOut = new PrintWriter(dstoreSocket.getOutputStream(), true)) {
+                                dstoreOut.println("REMOVE " + filename);
+                            } catch (IOException e) {
+                                System.out.println("Failed to connect to Dstore on port: " + port);
+                            }
+                        }).start();
                     }
 
-                    // Start timeout timer
                     new Thread(() -> {
                         try {
-                            Thread.sleep(3000); // or use 'timeOut' if needed
-                            if (removingFiles.contains(filename)) {
+                            Thread.sleep(timeOut);
+                            if (fileStates.get(filename) == FileState.REMOVE_IN_PROGRESS) {
                                 System.out.println("REMOVE timed out for " + filename);
-                                // Do nothing further, file remains in removing state
                             }
-                        } catch (InterruptedException ignored) {}
+                        } catch (InterruptedException ignored) {
+                        }
                     }).start();
-                }
-                else if (line.startsWith("REMOVE_ACK") || line.startsWith("ERROR_FILE_DOES_NOT_EXIST")) {
+
+                } else if (line.startsWith("REMOVE_ACK") || line.startsWith("ERROR_FILE_DOES_NOT_EXIST")) {
                     String[] parts = line.split(" ");
                     String filename = parts[1];
 
-                    int count = removeAckCounter.getOrDefault(filename, 0) + 1;
-                    removeAckCounter.put(filename, count);
-                    System.out.println("REMOVE_ACK or file missing for " + filename + ": " + count);
+                    int count = removeAckCounter.compute(filename, (k, v) -> (v == null) ? 1 : v + 1);
 
                     if (count >= rep) {
-                        removingFiles.remove(filename);
+                        fileStates.remove(filename);
                         fileToDstores.remove(filename);
                         fileToFileSize.remove(filename);
-                        allFilesList.remove(filename);
                         removeAckCounter.remove(filename);
 
                         Socket clientSocket = clientRemoveSockets.remove(filename);
                         if (clientSocket != null && !clientSocket.isClosed()) {
-                            PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
-                            clientOut.println("REMOVE_COMPLETE");
-                            System.out.println("REMOVE_COMPLETE sent for " + filename);
+                            try {
+                                PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
+                                clientOut.println("REMOVE_COMPLETE");
+                            } catch (IOException e) {
+                                System.out.println("Error responding to client for REMOVE " + filename);
+                            }
                         }
                     }
                 }
-
-
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            System.out.println("Connection error: " + e.getMessage());
         }
     }
 }

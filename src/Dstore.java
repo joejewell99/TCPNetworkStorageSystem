@@ -46,9 +46,11 @@ public class Dstore {
         ) {
             socket.setSoTimeout(timeout);
             String line = in.readLine();
-            if (line == null) return;
-
-            System.out.println("Dstore received: " + line);
+            if (line != null) {
+                System.out.println("Dstore received: " + line);
+            } else {
+                System.out.println("No data received on Dstore.");
+            }
 
             if (line.startsWith("STORE")) {
                 String[] parts = line.split(" ");
@@ -114,6 +116,8 @@ public class Dstore {
                         if (file.delete()) {
                             System.out.println("Deleted file: " + filename);
                             controllerOut.println("REMOVE_ACK " + filename);
+                            controllerOut.flush();
+
                         } else {
                             System.out.println("Failed to delete file: " + filename);
                         }

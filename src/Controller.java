@@ -13,7 +13,10 @@ public class Controller {
     private static final Map<String, Socket> clientRemoveSockets = new ConcurrentHashMap<>();
     private static final Map<Integer, DstoreInfo> dStores = new ConcurrentHashMap<>();
     private static final ExecutorService executorService = Executors.newCachedThreadPool(); // Using a thread pool for better management
-    private static int currentPort;
+    private static int currentRep;
+    private static final ConcurrentHashMap<String, CountDownLatch> removeLatches = new ConcurrentHashMap<>();
+    private int dstorefileFailures;
+
     enum FileStatus {
         STORE_IN_PROGRESS,
         STORE_COMPLETE,
@@ -26,6 +29,8 @@ public class Controller {
         int rep = Integer.parseInt(args[1]);
         int timeOut = Integer.parseInt(args[2]);
         int reFactor = Integer.parseInt(args[3]);
+
+        currentRep = rep;
 
         ServerSocket serverSocket = new ServerSocket(port);
         System.out.println("Controller running on port " + port);
@@ -47,7 +52,7 @@ public class Controller {
                 System.out.println("Received: " + line);
 
                 if (line.startsWith("JOIN")) {
-                    handleJoin(line, out);
+                    handleJoin(line, out, socket);
                 } else if (line.startsWith("STORE ")) {
                     handleStoreRequest(line, out, socket, rep);
                 } else if (line.startsWith("STORE_ACK")) {
@@ -60,28 +65,34 @@ public class Controller {
                     handleListRequest(out);
                 } else if (line.startsWith("LOAD")) {
                     handleLoadRequest(line, out);
+                } else if (line.startsWith("ERROR_FILE_DOES_NOT_EXIST")) {
+                    handleErrorFileDoesNotExist(line, rep);
                 }
+
             }
         } catch (IOException e) {
             System.out.println("Connection error: " + e.getMessage());
         }
     }
 
-    private static void handleJoin(String line, PrintWriter out) {
-        try {
-            int dstorePort = Integer.parseInt(line.split(" ")[1]);
-            synchronized (dstorePorts) {
-                if (!dstorePorts.contains(dstorePort)) {
-                    dstorePorts.add(dstorePort);
-                    dStores.put(dstorePort, new DstoreInfo());
-                    System.out.println("Dstore joined on port: " + dstorePort);
-                    out.println("JOIN_ACK");
-                } else {
-                    out.println("ERROR_DSTORE_ALREADY_JOINED");
-                }
+    private static void handleJoin(String line, PrintWriter out, Socket dstoreSocket) {
+        int dstorePort = Integer.parseInt(line.split(" ")[1]);
+
+        synchronized (dstorePorts) {
+            if (!dstorePorts.contains(dstorePort)) {
+                dstorePorts.add(dstorePort);
+                System.out.println(dstorePort + out.toString());
+                System.out.println(dstoreSocket.getPort());
+                DstoreInfo dstoreInfo = new DstoreInfo(dstoreSocket, out);
+                dStores.put(dstorePort, dstoreInfo);
+                System.out.println("Dstore joined on port: " + dstorePort);
+
+                // Keep this thread alive to receive further messages (like heartbeats)
+                listenToDstore(dstoreSocket, dstorePort);
+                return; // Important! Return to avoid closing socket after JOIN
+            } else {
+                out.println("ERROR_DSTORE_ALREADY_JOINED");
             }
-        } catch (NumberFormatException e) {
-            out.println("ERROR_INVALID_PORT");
         }
     }
 
@@ -89,6 +100,11 @@ public class Controller {
         String[] parts = line.split(" ");
         String filename = parts[1];
         int fileSize = Integer.parseInt(parts[2]);
+
+        if (parts.length != 3) {
+            System.out.println("Malformed STORE request: " + line);
+            return;
+        }
 
         synchronized (dstorePorts) {
             if (dstorePorts.size() < rep) {
@@ -156,53 +172,102 @@ public class Controller {
         }
     }
 
-    private static void handleRemoveRequest(String line, PrintWriter out, Socket socket, int rep, int timeOut) {
+    private static void handleRemoveRequest(String line, PrintWriter clientOut, Socket clientSocket, int rep, int timeoutMillis) {
         String[] parts = line.split(" ");
+        if (parts.length != 2) {
+            clientOut.println("ERROR_MALFORMED_REQUEST");
+            return;
+        }
+
         String filename = parts[1];
 
+        FileInfo fileInfo;
+        List<Integer> dstorePortsWithFile;
         synchronized (index) {
-            FileInfo fileInfo = index.get(filename);
+            fileInfo = index.get(filename);
+            dstorePortsWithFile = fileInfo.getDstores();
             if (fileInfo == null || fileInfo.getStatus() != FileStatus.STORE_COMPLETE) {
-                out.println("ERROR_FILE_DOES_NOT_EXIST");
+                clientOut.println("ERROR_FILE_DOES_NOT_EXIST");
                 return;
             }
             fileInfo.setStatus(FileStatus.REMOVE_IN_PROGRESS);
         }
 
         removeAckCounter.put(filename, 0);
-        clientRemoveSockets.put(filename, socket);
+        clientRemoveSockets.put(filename, clientSocket);
 
-        List<Integer> dStoresToRemove = index.get(filename).getDstores();
-        for (int port : dStoresToRemove) {
-            executorService.submit(() -> {
-                try (Socket dstoreSocket = new Socket("localhost", port);
-                     PrintWriter dstoreOut = new PrintWriter(dstoreSocket.getOutputStream(), true)) {
+        // Create and store the latch
+        CountDownLatch latch = new CountDownLatch(rep);
+        removeLatches.put(filename, latch);
+        System.out.println(dstorePortsWithFile);
+
+        for (int port : dstorePortsWithFile) {
+            new Thread(() -> {
+                try (Socket socket = new Socket("localhost", port);
+                     PrintWriter dstoreOut = new PrintWriter(socket.getOutputStream(), true)) {
                     dstoreOut.println("REMOVE " + filename);
                 } catch (IOException e) {
-                    System.out.println("Failed to connect to Dstore on port: " + port);
+                    System.out.println("Failed to send REMOVE to Dstore " + port + ": " + e.getMessage());
                 }
-            });
+            }).start();
         }
 
-        // Timeout thread for REMOVE operation
-        executorService.submit(() -> {
+
+        // Wait for the latch with a timeout
+        new Thread(() -> {
             try {
-                Thread.sleep(timeOut);
-                if (index.get(filename).getStatus() == FileStatus.REMOVE_IN_PROGRESS) {
-                    System.out.println("REMOVE timed out for " + filename);
+                boolean completed = latch.await(timeoutMillis, TimeUnit.MILLISECONDS);
+
+                if (!completed) {
+                    System.out.println("REMOVE timed out for file: " + filename);
+
+                    removeAckCounter.remove(filename);
+                    Socket sock = clientRemoveSockets.remove(filename);
+                    if (sock != null && !sock.isClosed()) {
+                        try {
+                            PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
+                            out.println("ERROR_TIMEOUT");
+                        } catch (IOException e) {
+                            System.out.println("Error sending timeout to client for " + filename);
+                        }
+                    }
+
+                    synchronized (index) {
+                        FileInfo info = index.get(filename);
+                        if (info != null) {
+                            info.setStatus(FileStatus.STORE_COMPLETE); // or consider partial retry logic
+                        }
+                    }
+
                 }
+
             } catch (InterruptedException ignored) {
+            } finally {
+                removeLatches.remove(filename);
             }
-        });
+        }).start();
     }
+
 
     private static void handleRemoveAck(String line, int rep) {
         String[] parts = line.split(" ");
         String filename = parts[1];
 
+        if (parts.length != 2) {
+            System.out.println("Malformed REMOVE_ACK message: " + line);
+            return;
+        }
+
         int count = removeAckCounter.compute(filename, (k, v) -> (v == null) ? 1 : v + 1);
 
-        if (count >= rep) {
+        // Count down the latch if present
+        CountDownLatch latch = removeLatches.get(filename);
+        if (latch != null) {
+            latch.countDown();
+        }
+        int dstorefileFailures = rep - index.get(filename).dstores.size();
+
+        if (count + dstorefileFailures >= rep) {
             FileInfo fileInfo = index.get(filename);
             if (fileInfo != null) {
                 List<Integer> dStoresWithFile = fileInfo.getDstores();
@@ -224,6 +289,18 @@ public class Controller {
             }
         }
     }
+
+
+    private static void handleErrorFileDoesNotExist(String line, int rep) {
+        String[] parts = line.split(" ");
+        if (parts.length == 2) {
+            String filename = parts[1];
+            handleRemoveAck(filename, rep);
+        } else {
+            System.out.println("Malformed ERROR_FILE_DOES_NOT_EXIST message: " + line);
+        }
+    }
+
 
     private static void handleListRequest(PrintWriter out) {
         synchronized (index) {
@@ -331,6 +408,15 @@ public class Controller {
 
     static class DstoreInfo {
         private int fileCount;
+        private Socket socket;
+        private PrintWriter out;
+        private long lastHeartbeat;
+
+        public DstoreInfo(Socket socket, PrintWriter out) {
+            this.socket = socket;
+            this.out = out;
+            this.lastHeartbeat = System.currentTimeMillis();
+        }
 
         public int getFileCount() {
             return fileCount;
@@ -343,5 +429,84 @@ public class Controller {
         public void decrementFileCount() {
             this.fileCount--;
         }
+
+        public Socket getSocket() {
+            return socket;
+        }
+
+        public PrintWriter getOut() {
+            return out;
+        }
+
+        public void updateHeartbeat() {
+            this.lastHeartbeat = System.currentTimeMillis();
+        }
+
+        public long getLastHeartbeat() {
+            return lastHeartbeat;
+        }
     }
+
+    private static void listenToDstore(Socket socket, int dstorePort) {
+        executorService.submit(() -> {
+            try (
+                    BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))
+            ) {
+                String msg;
+                while ((msg = in.readLine()) != null) {
+                    System.out.println("From Dstore " + dstorePort + ": " + msg);
+                    if (msg.equals("HEARTBEAT")) {
+                        dStores.get(dstorePort).updateHeartbeat();
+                    } else if (msg.startsWith("STORE_ACK")) {
+                        handleStoreAck(msg, currentRep);  // pass rep
+                    } else if (msg.startsWith("REMOVE_ACK")) {
+                        handleRemoveAck(msg, currentRep);  // pass rep
+                    }
+                    // Add more handlers as needed
+                }
+            } catch (IOException e) {
+                System.out.println("Dstore " + dstorePort + " disconnected.");
+                handleDstoreCrash(dstorePort);
+            }
+        });
+    }
+
+    private static synchronized void handleDstoreCrash(int port) {
+        System.out.println("Handling crash for Dstore on port " + port);
+
+        // Decrement file counts, remove files from index if needed, etc.
+        for (Map.Entry<String, FileInfo> entry : index.entrySet()) {
+            FileInfo info = entry.getValue();
+            if (info.getDstores() != null && info.getDstores().contains(port)) {
+                System.out.println(info.getDstores());
+                info.getDstores().remove((Integer) port);
+                info.setDstores(info.getDstores());
+                if(info.getDstores().isEmpty()){
+                    index.remove(entry.getKey());
+                    System.out.println("ITS EMPTY");
+                }
+                System.out.println(info.getDstores());
+                info.setStatus(FileStatus.STORE_COMPLETE);
+            }
+        }
+
+
+
+        try {
+            DstoreInfo info = dStores.get(port);
+            if (info != null && info.getSocket() != null) {
+                info.getSocket().close();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        // Remove Dstore from tracking
+        dStores.remove(port);
+        dstorePorts.remove((Integer) port);
+
+    }
+
+
 }
+

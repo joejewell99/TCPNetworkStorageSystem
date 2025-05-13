@@ -15,8 +15,7 @@ public class Controller {
     private static final ExecutorService executorService = Executors.newCachedThreadPool(); // Using a thread pool for better management
     private static int currentRep;
     private static final ConcurrentHashMap<String, CountDownLatch> removeLatches = new ConcurrentHashMap<>();
-    private int dstorefileFailures;
-
+    private static final Map<String, CountDownLatch> storeLatches = new ConcurrentHashMap<>();
     enum FileStatus {
         STORE_IN_PROGRESS,
         STORE_COMPLETE,
@@ -54,7 +53,7 @@ public class Controller {
                 if (line.startsWith("JOIN")) {
                     handleJoin(line, out, socket);
                 } else if (line.startsWith("STORE ")) {
-                    handleStoreRequest(line, out, socket, rep);
+                    handleStoreRequest(line, out, socket, rep, timeOut);
                 } else if (line.startsWith("STORE_ACK")) {
                     handleStoreAck(line, rep);
                 } else if (line.startsWith("REMOVE ")) {
@@ -62,7 +61,7 @@ public class Controller {
                 } else if (line.startsWith("REMOVE_ACK")) {
                     handleRemoveAck(line, rep);
                 } else if (line.startsWith("LIST")) {
-                    handleListRequest(out);
+                    handleListRequest(line, rep, out);
                 } else if (line.startsWith("LOAD")) {
                     handleLoadRequest(line, out);
                 } else if (line.startsWith("ERROR_FILE_DOES_NOT_EXIST")) {
@@ -96,7 +95,7 @@ public class Controller {
         }
     }
 
-    private static void handleStoreRequest(String line, PrintWriter out, Socket socket, int rep) {
+    private static void handleStoreRequest(String line, PrintWriter out, Socket socket, int rep, int timeoutMillis) {
         String[] parts = line.split(" ");
         String filename = parts[1];
         int fileSize = Integer.parseInt(parts[2]);
@@ -115,7 +114,7 @@ public class Controller {
 
         synchronized (index) {
             FileInfo fileInfo = index.get(filename);
-            if (fileInfo != null && fileInfo.getStatus() != FileStatus.REMOVE_COMPLETE) {
+            if (fileInfo != null && fileInfo.getStatus() != FileStatus.REMOVE_COMPLETE || index.containsKey(filename)) {
                 out.println("ERROR_FILE_ALREADY_EXISTS");
                 return;
             }
@@ -139,44 +138,85 @@ public class Controller {
                 response.append(" ").append(port);
             }
             out.println(response);
+
+            CountDownLatch latch = new CountDownLatch(rep);
+            storeLatches.put(filename, latch);
+            ackCounter.put(filename, 0);
+            clientStoreSockets.put(filename, socket);
+
+            new Thread(() -> {
+                try {
+                    boolean completed = latch.await(timeoutMillis, TimeUnit.MILLISECONDS);
+                    if (!completed) {
+                        System.out.println("STORE timed out for file: " + filename);
+
+                        ackCounter.remove(filename);
+                        storeLatches.remove(filename);
+
+                        // Leave file in current state; spec says nothing about rollback
+                        // but consider resetting to a previous safe state if desired
+
+                    }
+                } catch (InterruptedException ignored) {
+                } finally {
+                    storeLatches.remove(filename);
+                }
+            }).start();
+
         }
     }
 
 
     private static void handleStoreAck(String line, int rep) {
         String[] parts = line.split(" ");
+        if (parts.length != 2) {
+            System.out.println("Malformed STORE_ACK message: " + line);
+            return;
+        }
+
         String filename = parts[1];
 
         int count = ackCounter.compute(filename, (k, v) -> (v == null) ? 1 : v + 1);
         System.out.println("ACK received for file: " + filename + " (" + count + "/" + rep + ")");
 
+        CountDownLatch latch = storeLatches.get(filename);
+        if (latch != null) {
+            latch.countDown();
+        }
+
         if (count >= rep) {
-            // Notify the client that the file is stored
             Socket clientSocket = clientStoreSockets.remove(filename);
             if (clientSocket != null && !clientSocket.isClosed()) {
                 try {
                     PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
                     FileInfo fileInfo = index.get(filename);
-                    List<Integer> dStoresWithFile = fileInfo.getDstores();
-                    System.out.println(dStoresWithFile);
-                    clientOut.println("STORE_COMPLETE");
+                    if (fileInfo != null) {
+                        clientOut.println("STORE_COMPLETE");
+                        fileInfo.setStatus(FileStatus.STORE_COMPLETE);
+                    }
                 } catch (IOException e) {
                     System.out.println("Error responding to client for " + filename);
+                    index.remove(filename);
                 }
             }
             ackCounter.remove(filename);
-            FileInfo fileInfo = index.get(filename);
-            if (fileInfo != null) {
-                fileInfo.setStatus(FileStatus.STORE_COMPLETE);
-            }
+            storeLatches.remove(filename);
         }
     }
+
 
     private static void handleRemoveRequest(String line, PrintWriter clientOut, Socket clientSocket, int rep, int timeoutMillis) {
         String[] parts = line.split(" ");
         if (parts.length != 2) {
-            clientOut.println("ERROR_MALFORMED_REQUEST");
+            System.out.println("ERROR_MALFORMED_REQUEST");
             return;
+        }
+
+        synchronized (dstorePorts) {
+            if (dstorePorts.size() < rep) {
+                clientOut.println("ERROR_NOT_ENOUGH_DSTORES");
+                return;
+            }
         }
 
         String filename = parts[1];
@@ -186,7 +226,7 @@ public class Controller {
         synchronized (index) {
             fileInfo = index.get(filename);
             dstorePortsWithFile = fileInfo.getDstores();
-            if (fileInfo == null || fileInfo.getStatus() != FileStatus.STORE_COMPLETE) {
+            if (fileInfo.getStatus() != FileStatus.STORE_COMPLETE || !index.containsKey(filename)) {
                 clientOut.println("ERROR_FILE_DOES_NOT_EXIST");
                 return;
             }
@@ -226,16 +266,9 @@ public class Controller {
                     if (sock != null && !sock.isClosed()) {
                         try {
                             PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
-                            out.println("ERROR_TIMEOUT");
+                            System.out.println("ERROR_TIMEOUT");
                         } catch (IOException e) {
                             System.out.println("Error sending timeout to client for " + filename);
-                        }
-                    }
-
-                    synchronized (index) {
-                        FileInfo info = index.get(filename);
-                        if (info != null) {
-                            info.setStatus(FileStatus.STORE_COMPLETE); // or consider partial retry logic
                         }
                     }
 
@@ -292,17 +325,25 @@ public class Controller {
 
 
     private static void handleErrorFileDoesNotExist(String line, int rep) {
-        String[] parts = line.split(" ");
-        if (parts.length == 2) {
-            String filename = parts[1];
-            handleRemoveAck(filename, rep);
-        } else {
-            System.out.println("Malformed ERROR_FILE_DOES_NOT_EXIST message: " + line);
-        }
+        handleRemoveAck(line, rep);
+
     }
 
 
-    private static void handleListRequest(PrintWriter out) {
+    private static void handleListRequest(String line, int rep, PrintWriter out) {
+        String[] parts = line.split(" ");
+        if (parts.length != 1) {
+            System.out.println("Malformed LIST request: ");
+            return;
+        }
+
+        synchronized (dstorePorts) {
+            if (dstorePorts.size() < rep) {
+                out.println("ERROR_NOT_ENOUGH_DSTORES");
+                return;
+            }
+        }
+
         synchronized (index) {
             List<String> fileList = new ArrayList<>();
             for (Map.Entry<String, FileInfo> entry : index.entrySet()) {

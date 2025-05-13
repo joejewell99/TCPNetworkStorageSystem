@@ -19,6 +19,17 @@ public class Dstore {
         for (File file : folder.listFiles()) {
             file.delete();
         }
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutdown hook triggered. Cleaning up...");
+            File folderToDelete = new File(fileFolder);
+            if (folderToDelete.exists()) {
+                for (File file : folderToDelete.listFiles()) {
+                    file.delete();
+                }
+                folderToDelete.delete();
+            }
+        }));
+
 
         // Join controller
         Socket controllerSocket = new Socket("localhost", cport);

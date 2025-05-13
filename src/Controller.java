@@ -16,6 +16,11 @@ public class Controller {
     private static int currentRep;
     private static final ConcurrentHashMap<String, CountDownLatch> removeLatches = new ConcurrentHashMap<>();
     private static final Map<String, CountDownLatch> storeLatches = new ConcurrentHashMap<>();
+    private static final Map<Integer, PrintWriter> dstoreWriters = new ConcurrentHashMap<>();
+    // A map to track failed ports for each file
+    private static final Map<String, List<Integer>> failedPortsForFile = new ConcurrentHashMap<>();
+    private static final ConcurrentMap<String, Object> fileLocks = new ConcurrentHashMap<>();
+
     enum FileStatus {
         STORE_IN_PROGRESS,
         STORE_COMPLETE,
@@ -34,10 +39,17 @@ public class Controller {
         ServerSocket serverSocket = new ServerSocket(port);
         System.out.println("Controller running on port " + port);
 
-        while (true) {
-            Socket socket = serverSocket.accept();
-            executorService.submit(() -> handleConnection(socket, rep, timeOut, reFactor));
-        }
+        // Accept Dstore connections
+        new Thread(() -> {
+            while (true) {
+                try {
+                    Socket socket = serverSocket.accept();
+                    executorService.submit(() -> handleConnection(socket, rep, timeOut, reFactor));
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }).start();
     }
 
     private static void handleConnection(Socket socket, int rep, int timeOut, int reFactor) {
@@ -66,6 +78,8 @@ public class Controller {
                     handleLoadRequest(line, out);
                 } else if (line.startsWith("ERROR_FILE_DOES_NOT_EXIST")) {
                     handleErrorFileDoesNotExist(line, rep);
+                } else if (line.startsWith("RELOAD")){
+                    handleReloadRequest(line,out);
                 }
 
             }
@@ -82,6 +96,8 @@ public class Controller {
                 dstorePorts.add(dstorePort);
                 System.out.println(dstorePort + out.toString());
                 System.out.println(dstoreSocket.getPort());
+                dstoreWriters.put(dstorePort,out);
+                System.out.println(dstoreWriters.keySet() + " " +dstoreWriters.get(dstorePort));
                 DstoreInfo dstoreInfo = new DstoreInfo(dstoreSocket, out);
                 dStores.put(dstorePort, dstoreInfo);
                 System.out.println("Dstore joined on port: " + dstorePort);
@@ -130,8 +146,6 @@ public class Controller {
             }
 
             fileInfo.setDstores(selectedPorts);
-            ackCounter.put(filename, 0);
-            clientStoreSockets.put(filename, socket);
 
             StringBuilder response = new StringBuilder("STORE_TO");
             for (int port : selectedPorts) {
@@ -205,12 +219,16 @@ public class Controller {
     }
 
 
-    private static void handleRemoveRequest(String line, PrintWriter clientOut, Socket clientSocket, int rep, int timeoutMillis) {
+
+
+    private static synchronized void handleRemoveRequest(String line, PrintWriter clientOut, Socket clientSocket, int rep, int timeoutMillis) {
         String[] parts = line.split(" ");
         if (parts.length != 2) {
             System.out.println("ERROR_MALFORMED_REQUEST");
             return;
         }
+
+        String filename = parts[1];
 
         synchronized (dstorePorts) {
             if (dstorePorts.size() < rep) {
@@ -219,39 +237,36 @@ public class Controller {
             }
         }
 
-        String filename = parts[1];
-
         FileInfo fileInfo;
         List<Integer> dstorePortsWithFile;
         synchronized (index) {
             fileInfo = index.get(filename);
-            dstorePortsWithFile = fileInfo.getDstores();
-            if (fileInfo.getStatus() != FileStatus.STORE_COMPLETE || !index.containsKey(filename)) {
+            if (fileInfo == null || fileInfo.getStatus() != FileStatus.STORE_COMPLETE) {
                 clientOut.println("ERROR_FILE_DOES_NOT_EXIST");
                 return;
             }
+
             fileInfo.setStatus(FileStatus.REMOVE_IN_PROGRESS);
+            dstorePortsWithFile = fileInfo.getDstores();
         }
 
+        // Track acknowledgements and client socket
         removeAckCounter.put(filename, 0);
         clientRemoveSockets.put(filename, clientSocket);
 
-        // Create and store the latch
+        // Set up latch for timeout
         CountDownLatch latch = new CountDownLatch(rep);
         removeLatches.put(filename, latch);
-        System.out.println(dstorePortsWithFile);
+        System.out.println("Sending REMOVE to dstores: " + dstorePortsWithFile);
 
+        // Send REMOVE to each Dstore
         for (int port : dstorePortsWithFile) {
-            new Thread(() -> {
-                try (Socket socket = new Socket("localhost", port);
-                     PrintWriter dstoreOut = new PrintWriter(socket.getOutputStream(), true)) {
-                    dstoreOut.println("REMOVE " + filename);
-                } catch (IOException e) {
-                    System.out.println("Failed to send REMOVE to Dstore " + port + ": " + e.getMessage());
-                }
-            }).start();
+            executorService.submit(() -> {
+                PrintWriter dstoreOut = dstoreWriters.get(port);{
+                   dstoreOut.println("REMOVE " + filename);
+               }
+            });
         }
-
 
         // Wait for the latch with a timeout
         new Thread(() -> {
@@ -260,26 +275,19 @@ public class Controller {
 
                 if (!completed) {
                     System.out.println("REMOVE timed out for file: " + filename);
-
+                    // No further action per spec, but clean up temporary state
                     removeAckCounter.remove(filename);
-                    Socket sock = clientRemoveSockets.remove(filename);
-                    if (sock != null && !sock.isClosed()) {
-                        try {
-                            PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
-                            System.out.println("ERROR_TIMEOUT");
-                        } catch (IOException e) {
-                            System.out.println("Error sending timeout to client for " + filename);
-                        }
-                    }
-
+                    removeLatches.remove(filename);
+                    clientRemoveSockets.remove(filename);
+                    // Leave index entry in REMOVE_IN_PROGRESS for rebalancing
                 }
 
             } catch (InterruptedException ignored) {
-            } finally {
-                removeLatches.remove(filename);
+                System.out.println("we got interupted");
             }
         }).start();
     }
+
 
 
     private static void handleRemoveAck(String line, int rep) {
@@ -298,6 +306,7 @@ public class Controller {
         if (latch != null) {
             latch.countDown();
         }
+
         int dstorefileFailures = rep - index.get(filename).dstores.size();
 
         if (count + dstorefileFailures >= rep) {
@@ -307,6 +316,7 @@ public class Controller {
                 for (int currentPort : dStoresWithFile) {
                     dStores.get(currentPort).decrementFileCount();
                 }
+                System.out.println("fileRemoved");
                 index.remove(filename);
                 removeAckCounter.remove(filename);
             }
@@ -353,14 +363,14 @@ public class Controller {
             }
 
             if (fileList.isEmpty()) {
-                out.println("LIST");
+                out.println("LIST ");
             } else {
                 out.println("LIST " + String.join(" ", fileList));
             }
         }
     }
 
-    private static void handleLoadRequest(String line, PrintWriter out) {
+    public static synchronized void handleLoadRequest(String line, PrintWriter out) {
         String[] parts = line.split(" ");
         String filename = parts[1];
 
@@ -377,8 +387,70 @@ public class Controller {
                 return;
             }
 
-            int chosenPort = dStoresWithFile.get(new Random().nextInt(dStoresWithFile.size()));
+            // Get the list of failed ports for this file (if any)
+            List<Integer> failedPorts = failedPortsForFile.getOrDefault(filename, new ArrayList<>());
+
+            // Filter out the failed ports from the available DStores
+            List<Integer> availablePorts = new ArrayList<>(dStoresWithFile);
+            availablePorts.removeAll(failedPorts);
+
+            // If all ports have failed, return an error
+            if (availablePorts.isEmpty()) {
+                out.println("ERROR_FILE_DOES_NOT_EXIST");
+                return;
+            }
+
+            // Randomly select a port that has not been used before
+            int chosenPort = availablePorts.get(new Random().nextInt(availablePorts.size()));
+
+            // Send the load request to the chosen port
             out.println("LOAD_FROM " + chosenPort + " " + fileInfo.getFileSize());
+
+            // If the request fails, we add the port to the list of failed ports
+            failedPorts.add(chosenPort);
+            failedPortsForFile.put(filename, failedPorts);
+        }
+    }
+
+    public static void handleReloadRequest(String line, PrintWriter out) {
+        String[] parts = line.split(" ");
+        String filename = parts[1];
+
+        synchronized (index) {
+            FileInfo fileInfo = index.get(filename);
+            if (fileInfo == null || fileInfo.getStatus() != FileStatus.STORE_COMPLETE) {
+                out.println("ERROR_FILE_DOES_NOT_EXIST");
+                return;
+            }
+
+            List<Integer> dStoresWithFile = fileInfo.getDstores();
+            if (dStoresWithFile == null || dStoresWithFile.isEmpty()) {
+                out.println("ERROR_FILE_DOES_NOT_EXIST");
+                return;
+            }
+
+            // Get the list of failed ports for this file
+            List<Integer> failedPorts = failedPortsForFile.getOrDefault(filename, new ArrayList<>());
+
+            // Filter out the failed ports from the available DStores
+            List<Integer> availablePorts = new ArrayList<>(dStoresWithFile);
+            availablePorts.removeAll(failedPorts);
+
+            // If all ports have failed, return an error
+            if (availablePorts.isEmpty()) {
+                out.println("ERROR_FILE_DOES_NOT_EXIST");
+                return;
+            }
+
+            // Randomly select a port that has not been used before
+            int chosenPort = availablePorts.get(new Random().nextInt(availablePorts.size()));
+
+            // Send the load request to the chosen port
+            out.println("LOAD_FROM " + chosenPort + " " + fileInfo.getFileSize());
+
+            // If the request fails, we add the port to the list of failed ports
+            failedPorts.add(chosenPort);
+            failedPortsForFile.put(filename, failedPorts);
         }
     }
 
@@ -406,6 +478,8 @@ public class Controller {
         // Trim to exactly `rep` if more than needed (e.g., from ties)
         return result.subList(0, rep);
     }
+
+
 
 
     // FileInfo and DstoreInfo Classes
@@ -514,21 +588,29 @@ public class Controller {
 
     private static synchronized void handleDstoreCrash(int port) {
         System.out.println("Handling crash for Dstore on port " + port);
-
+        List<String> toRemove = new ArrayList<>();
         // Decrement file counts, remove files from index if needed, etc.
-        for (Map.Entry<String, FileInfo> entry : index.entrySet()) {
-            FileInfo info = entry.getValue();
-            if (info.getDstores() != null && info.getDstores().contains(port)) {
-                System.out.println(info.getDstores());
-                info.getDstores().remove((Integer) port);
-                info.setDstores(info.getDstores());
-                if(info.getDstores().isEmpty()){
-                    index.remove(entry.getKey());
-                    System.out.println("ITS EMPTY");
+        synchronized (index) {
+            for (Map.Entry<String, FileInfo> entry : index.entrySet()) {
+                FileInfo info = entry.getValue();
+                synchronized (info) {
+                    if (info.getDstores() != null && info.getDstores().contains(port)) {
+                        System.out.println(info.getDstores());
+                        info.getDstores().remove((Integer) port);
+                        info.setDstores(info.getDstores());
+                        if (info.getDstores().isEmpty()) {
+                            toRemove.add(entry.getKey());
+                            System.out.println("ITS EMPTY");
+                        }
+                        System.out.println(info.getDstores());
+                        info.setStatus(FileStatus.STORE_COMPLETE);
+                    }
                 }
-                System.out.println(info.getDstores());
-                info.setStatus(FileStatus.STORE_COMPLETE);
             }
+        }
+
+        for (String key : toRemove) {
+            index.remove(key);
         }
 
 
